@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 
 const SUPABASE_URL = "https://fsmzzjqmzdcsvslbxswe.supabase.co";
 const SUPABASE_KEY = "sb_publishable_Pb-jEUw5j14nK64MVSDzRg_c4_5lxWr";
@@ -29,6 +29,49 @@ const TIPOS_ACERO = [
   "Acero estructural", "Acero laminado en frío", "Acero laminado en caliente",
   "Acero aleado", "Acero para herramientas",
 ];
+
+const COL_MAP = {
+  "no_requisicion":   ["no_requisicion", "no. req.", "requisicion", "num requisicion", "número requisición"],
+  "proyecto":         ["proyecto", "project", "nombre proyecto"],
+  "toneladas":        ["toneladas", "tons", "ton", "weight"],
+  "tipo_acero":       ["tipo_acero", "tipo acero", "tipo de acero", "acero"],
+  "fecha_requisicion":["fecha_requisicion", "fecha requisicion", "fecha req", "fecha de requisicion"],
+  "fecha_requerida":  ["fecha_requerida", "fecha requerida", "fecha planta", "fecha requerida por planta"],
+  "proveedor":        ["proveedor", "supplier", "vendor"],
+  "estatus":          ["estatus", "status", "estado"],
+  "precio":           ["precio", "costo", "price", "costo estimado"],
+  "comentarios":      ["comentarios", "comments", "observaciones", "notas"],
+};
+
+function parseExcelDate(val) {
+  if (!val) return "";
+  if (typeof val === "number") {
+    const date = new Date(Math.round((val - 25569) * 86400 * 1000));
+    return date.toISOString().split("T")[0];
+  }
+  if (typeof val === "string") {
+    const parts = val.includes("/") ? val.split("/") : val.includes("-") ? val.split("-") : null;
+    if (parts && parts.length === 3) {
+      if (parts[2].length === 4) return `${parts[2]}-${parts[1].padStart(2,"0")}-${parts[0].padStart(2,"0")}`;
+      if (parts[0].length === 4) return val;
+    }
+  }
+  return "";
+}
+
+function mapRow(headers, row) {
+  const mapped = {};
+  headers.forEach((h, i) => {
+    const normalized = (h || "").toLowerCase().trim();
+    for (const [field, aliases] of Object.entries(COL_MAP)) {
+      if (aliases.includes(normalized)) {
+        mapped[field] = row[i] !== undefined ? String(row[i]).trim() : "";
+        break;
+      }
+    }
+  });
+  return mapped;
+}
 
 const emptyForm = {
   no_requisicion: "", proyecto: "", toneladas: "", tipo_acero: "",
@@ -61,6 +104,9 @@ export default function App() {
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [sortCol, setSortCol] = useState("fecha_requisicion");
   const [sortDir, setSortDir] = useState("desc");
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const fileInputRef = useRef();
 
   const fetchData = async () => {
     try {
@@ -155,6 +201,69 @@ export default function App() {
     setDeleteConfirm(null);
   };
 
+  const downloadTemplate = () => {
+    const headers = ["no_requisicion","proyecto","toneladas","tipo_acero","fecha_requisicion","fecha_requerida","proveedor","estatus","precio","comentarios"];
+    const example = ["REQ-2024-001","Planta Monterrey","45.5","Acero estructural","2024-04-10","2024-06-15","AHMSA","Pendiente","850000","Urgente"];
+    const csv = [headers.join(","), example.join(",")].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "plantilla_requisiciones.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = "";
+    setImporting(true);
+    setImportResult(null);
+
+    try {
+      const text = await file.text();
+      const lines = text.split("\n").filter(l => l.trim());
+      if (lines.length < 2) throw new Error("El archivo está vacío o solo tiene encabezados.");
+
+      const headers = lines[0].split(",").map(h => h.replace(/"/g, "").toLowerCase().trim());
+      const rows = lines.slice(1).map(line => {
+        const vals = line.split(",").map(v => v.replace(/"/g, "").trim());
+        return mapRow(headers, vals);
+      }).filter(r => r.proyecto || r.no_requisicion);
+
+      if (rows.length === 0) throw new Error("No se encontraron filas válidas.");
+
+      const payloads = rows.map(r => ({
+        no_requisicion: r.no_requisicion || "",
+        proyecto: r.proyecto || "",
+        toneladas: r.toneladas ? Number(r.toneladas) : null,
+        tipo_acero: r.tipo_acero || "",
+        fecha_requisicion: parseExcelDate(r.fecha_requisicion) || null,
+        fecha_requerida: parseExcelDate(r.fecha_requerida) || null,
+        proveedor: r.proveedor || "",
+        estatus: Object.keys(ESTATUS_CONFIG).includes(r.estatus) ? r.estatus : "Pendiente",
+        precio: r.precio ? Number(r.precio) : null,
+        comentarios: r.comentarios || "",
+      }));
+
+      let ok = 0, fail = 0;
+      for (const p of payloads) {
+        try {
+          await supabase("POST", p);
+          ok++;
+        } catch { fail++; }
+      }
+
+      await fetchData();
+      setImportResult({ ok, fail });
+    } catch (err) {
+      setImportResult({ error: err.message });
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const SortIcon = ({ col }) => {
     if (sortCol !== col) return <span style={{ opacity: 0.3, marginLeft: 4 }}>↕</span>;
     return <span style={{ marginLeft: 4, color: "#B45309" }}>{sortDir === "asc" ? "↑" : "↓"}</span>;
@@ -187,11 +296,23 @@ export default function App() {
             <div style={{ color: "#B45309", fontSize: 12, letterSpacing: 3, textTransform: "uppercase", marginTop: 2 }}>Control y Seguimiento</div>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button onClick={fetchData} style={{ background: "none", border: "1px solid #B45309", color: "#B45309", padding: "8px 14px", borderRadius: 4, cursor: "pointer", fontSize: 13, fontFamily: "Georgia, serif" }}>🔄 Actualizar</button>
+          <button onClick={downloadTemplate} style={{ background: "none", border: "1px solid #6B6B5B", color: "#D4C5A9", padding: "8px 14px", borderRadius: 4, cursor: "pointer", fontSize: 13, fontFamily: "Georgia, serif" }}>📥 Plantilla CSV</button>
+          <button onClick={() => fileInputRef.current.click()} disabled={importing} style={{ background: importing ? "#6B6B5B" : "#2D5016", color: "#fff", border: "none", padding: "8px 14px", borderRadius: 4, cursor: importing ? "not-allowed" : "pointer", fontSize: 13, fontFamily: "Georgia, serif" }}>
+            {importing ? "Importando…" : "📤 Importar CSV"}
+          </button>
+          <input ref={fileInputRef} type="file" accept=".csv" onChange={handleImportFile} style={{ display: "none" }} />
           <button onClick={openNew} style={{ background: "#B45309", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 4, fontSize: 14, fontWeight: "bold", cursor: "pointer", fontFamily: "Georgia, serif" }}>+ Nueva Requisición</button>
         </div>
       </div>
+
+      {importResult && (
+        <div style={{ background: importResult.error ? "#FEE2E2" : "#D1FAE5", border: `1px solid ${importResult.error ? "#EF4444" : "#10B981"}`, color: importResult.error ? "#B91C1C" : "#065F46", padding: "12px 40px", fontSize: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          {importResult.error ? `⚠️ Error: ${importResult.error}` : `✅ Importación completada: ${importResult.ok} registros cargados${importResult.fail > 0 ? `, ${importResult.fail} fallidos` : ""}.`}
+          <button onClick={() => setImportResult(null)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 16 }}>✕</button>
+        </div>
+      )}
 
       {error && (
         <div style={{ background: "#FEE2E2", border: "1px solid #EF4444", color: "#B91C1C", padding: "12px 40px", fontSize: 14 }}>
